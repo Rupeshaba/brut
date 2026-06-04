@@ -2,69 +2,116 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
     <title>HOD Login Auditor</title>
+    <!-- Tailwind CSS CDN -->
     <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Socket.io client -->
     <script src="/socket.io/socket.io.js"></script>
+    <style>
+        /* Smooth transitions for progress bar */
+        .progress-transition {
+            transition: width 0.3s ease-in-out;
+        }
+        /* Make table scrollable on mobile */
+        .table-container {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+    </style>
 </head>
-<body class="bg-gray-900 text-white">
-    <div class="container mx-auto p-6">
-        <h1 class="text-3xl font-bold mb-6">🔐 HOD Login Auditor</h1>
+<body class="bg-gradient-to-br from-gray-900 to-gray-800 text-white min-h-screen">
+    <div class="container mx-auto px-4 py-6 max-w-6xl">
+        <!-- Header -->
+        <div class="text-center mb-8">
+            <h1 class="text-3xl md:text-4xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-400">
+                🔐 HOD Login Auditor
+            </h1>
+            <p class="text-gray-400 text-sm mt-1">Multi‑examiner parallel attack</p>
+        </div>
 
-        <!-- Stats Cards -->
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
-            <div class="bg-gray-800 p-4 rounded-lg shadow">
-                <div class="text-gray-400 text-sm">Total Examiners</div>
-                <div class="text-2xl font-bold" id="totalExaminers">0</div>
+        <!-- Stats Cards Grid (responsive) -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-6">
+            <div class="bg-gray-800/80 backdrop-blur rounded-xl p-3 shadow-lg border border-gray-700">
+                <div class="text-gray-400 text-xs uppercase tracking-wide">Total Examiners</div>
+                <div class="text-2xl font-bold text-white" id="totalExaminers">0</div>
             </div>
-            <div class="bg-gray-800 p-4 rounded-lg shadow">
-                <div class="text-gray-400 text-sm">Successes Found</div>
+            <div class="bg-gray-800/80 backdrop-blur rounded-xl p-3 shadow-lg border border-gray-700">
+                <div class="text-gray-400 text-xs uppercase tracking-wide">Successes</div>
                 <div class="text-2xl font-bold text-green-400" id="successCount">0</div>
             </div>
-            <div class="bg-gray-800 p-4 rounded-lg shadow">
-                <div class="text-gray-400 text-sm">Speed</div>
+            <div class="bg-gray-800/80 backdrop-blur rounded-xl p-3 shadow-lg border border-gray-700">
+                <div class="text-gray-400 text-xs uppercase tracking-wide">Speed (req/s)</div>
                 <div class="text-2xl font-bold text-blue-400" id="speed">0</div>
-                <div class="text-xs text-gray-500">req/sec</div>
             </div>
-            <div class="bg-gray-800 p-4 rounded-lg shadow">
-                <div class="text-gray-400 text-sm">Status</div>
+            <div class="bg-gray-800/80 backdrop-blur rounded-xl p-3 shadow-lg border border-gray-700">
+                <div class="text-gray-400 text-xs uppercase tracking-wide">Status</div>
                 <div class="text-xl font-bold" id="statusText">Idle</div>
             </div>
         </div>
 
-        <!-- Progress -->
-        <div class="bg-gray-800 p-4 rounded-lg shadow mb-6">
-            <div class="flex justify-between mb-2">
-                <span>Progress (current examiner)</span>
+        <!-- RAM Usage Card (real-time) -->
+        <div class="bg-gray-800/50 rounded-xl p-3 mb-6 border border-gray-700">
+            <div class="flex flex-wrap justify-between items-center gap-2">
+                <span class="text-gray-300 text-sm flex items-center gap-1">
+                    <span class="inline-block w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
+                    📟 Live RAM Usage
+                </span>
+                <div class="flex gap-4 text-sm">
+                    <div><span class="text-gray-400">RSS:</span> <span id="ramRss" class="font-mono font-bold text-yellow-300">0</span> MB</div>
+                    <div><span class="text-gray-400">Heap Used:</span> <span id="ramHeapUsed" class="font-mono font-bold text-yellow-300">0</span> MB</div>
+                    <div><span class="text-gray-400">Heap Total:</span> <span id="ramHeapTotal" class="font-mono text-gray-300">0</span> MB</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Progress Section -->
+        <div class="bg-gray-800/50 rounded-xl p-4 mb-6 border border-gray-700">
+            <div class="flex justify-between text-sm mb-1">
+                <span>Progress by examiner</span>
                 <span id="progressPercent">0%</span>
             </div>
-            <div class="w-full bg-gray-700 rounded-full h-4">
-                <div class="bg-blue-500 h-4 rounded-full transition-all duration-300" id="progressBar" style="width: 0%"></div>
+            <div class="w-full bg-gray-700 rounded-full h-3 mb-3">
+                <div id="progressBar" class="bg-gradient-to-r from-blue-500 to-purple-500 h-3 rounded-full progress-transition" style="width: 0%"></div>
             </div>
-            <div class="text-sm text-gray-400 mt-2" id="currentTask">Waiting...</div>
+            <div id="currentTask" class="text-sm text-gray-300 break-all">Ready</div>
         </div>
 
-        <!-- Controls -->
-        <div class="flex gap-3 mb-6">
-            <button id="startBtn" class="bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg font-semibold">▶ Start</button>
-            <button id="pauseBtn" class="bg-yellow-600 hover:bg-yellow-700 px-6 py-2 rounded-lg font-semibold">⏸ Pause</button>
-            <button id="resumeBtn" class="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg font-semibold">⏵ Resume</button>
-            <button id="stopBtn" class="bg-red-600 hover:bg-red-700 px-6 py-2 rounded-lg font-semibold">⏹ Stop & Reset</button>
+        <!-- Control Buttons (responsive grid) -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-8">
+            <button id="startBtn" class="bg-green-600 hover:bg-green-700 active:scale-95 transition transform py-2 rounded-lg font-semibold shadow-lg">▶ Start</button>
+            <button id="pauseBtn" class="bg-yellow-600 hover:bg-yellow-700 active:scale-95 transition transform py-2 rounded-lg font-semibold shadow-lg">⏸ Pause</button>
+            <button id="resumeBtn" class="bg-blue-600 hover:bg-blue-700 active:scale-95 transition transform py-2 rounded-lg font-semibold shadow-lg">⏵ Resume</button>
+            <button id="stopBtn" class="bg-red-600 hover:bg-red-700 active:scale-95 transition transform py-2 rounded-lg font-semibold shadow-lg">⏹ Stop & Reset</button>
         </div>
 
-        <!-- Success Table -->
-        <div class="bg-gray-800 rounded-lg shadow overflow-hidden">
-            <div class="px-4 py-3 border-b border-gray-700 font-semibold">✅ Found Credentials</div>
-            <div class="overflow-x-auto">
+        <!-- Success Table (scrollable) -->
+        <div class="bg-gray-800/50 rounded-xl overflow-hidden border border-gray-700">
+            <div class="px-4 py-3 bg-gray-800 border-b border-gray-700 font-semibold flex justify-between items-center flex-wrap gap-2">
+                <span>✅ Found Credentials</span>
+                <span class="text-xs text-gray-400">Real‑time</span>
+            </div>
+            <div class="table-container">
                 <table class="w-full text-sm">
                     <thead class="bg-gray-700">
-                        <tr><th class="px-4 py-2 text-left">Examiner ID</th><th class="px-4 py-2 text-left">Password</th><th class="px-4 py-2 text-left">Time</th></tr>
+                        <tr>
+                            <th class="px-3 py-2 text-left">Examiner ID</th>
+                            <th class="px-3 py-2 text-left">Password</th>
+                            <th class="px-3 py-2 text-left">Time</th>
+                        </tr>
                     </thead>
                     <tbody id="successTableBody">
-                        <tr><td colspan="3" class="px-4 py-2 text-center text-gray-500">No successes yet</td></tr>
+                        <tr>
+                            <td colspan="3" class="px-3 py-6 text-center text-gray-500">No successes yet</td>
+                        </tr>
                     </tbody>
                 </table>
             </div>
+        </div>
+
+        <!-- Footer note -->
+        <div class="text-center text-gray-500 text-xs mt-6">
+            Attack runs sequentially per examiner | 1M passwords per ID
         </div>
     </div>
 
@@ -73,64 +120,103 @@
         let totalExaminers = 0;
         let totalPasswords = 0;
 
+        // Helper: update success table
         function updateSuccessTable(successes) {
             const tbody = document.getElementById('successTableBody');
             if (!successes || successes.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="3" class="px-4 py-2 text-center text-gray-500">No successes yet</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="3" class="px-3 py-6 text-center text-gray-500">No successes yet</td></tr>';
                 return;
             }
-            tbody.innerHTML = successes.map(s => `
+            // Build table rows (most recent first? server sends array, we'll show in order)
+            const rows = successes.map(s => `
                 <tr class="border-t border-gray-700">
-                    <td class="px-4 py-2">${s.examinerId}</td>
-                    <td class="px-4 py-2">${s.password}</td>
-                    <td class="px-4 py-2">${s.time ? new Date(s.time).toLocaleString() : '-'}</td>
+                    <td class="px-3 py-2 font-mono text-xs">${escapeHtml(s.examinerId)}</td>
+                    <td class="px-3 py-2 font-mono text-xs">${escapeHtml(s.password)}</td>
+                    <td class="px-3 py-2 text-xs">${s.time ? new Date(s.time).toLocaleString() : '-'}</td>
                 </tr>
             `).join('');
+            tbody.innerHTML = rows;
             document.getElementById('successCount').innerText = successes.length;
         }
 
+        // Simple escape to avoid XSS
+        function escapeHtml(str) {
+            if (!str) return '';
+            return str.replace(/[&<>]/g, function(m) {
+                if (m === '&') return '&amp;';
+                if (m === '<') return '&lt;';
+                if (m === '>') return '&gt;';
+                return m;
+            });
+        }
+
+        // Socket event handlers
         socket.on('init', (data) => {
             totalExaminers = data.totalExaminers;
             totalPasswords = data.totalPasswords || 0;
             document.getElementById('totalExaminers').innerText = totalExaminers;
             updateSuccessTable(data.successes || []);
+            // Update progress based on checkpoint
             if (data.currentExaminerIndex !== undefined) {
-                const percent = totalPasswords ? (data.currentPasswordIndex / totalPasswords * 100) : 0;
+                const percent = totalExaminers ? (data.currentExaminerIndex / totalExaminers * 100) : 0;
                 document.getElementById('progressBar').style.width = `${percent}%`;
                 document.getElementById('progressPercent').innerText = `${Math.round(percent)}%`;
-                document.getElementById('currentTask').innerHTML = `Examiner ${data.currentExaminerIndex+1}/${totalExaminers} | Password ${data.currentPasswordIndex}/${totalPasswords}`;
+                document.getElementById('currentTask').innerHTML = `Examiner ${data.currentExaminerIndex+1}/${totalExaminers} | Password #${data.currentPasswordIndex} of ${totalPasswords}`;
             }
             const status = data.isRunning ? 'Running' : (data.isPaused ? 'Paused' : 'Idle');
-            document.getElementById('statusText').innerHTML = status === 'Running' ? '<span class="text-green-400">Running</span>' : (status === 'Paused' ? '<span class="text-yellow-400">Paused</span>' : '<span class="text-gray-400">Idle</span>');
+            updateStatusUI(status);
         });
 
         socket.on('progress', (data) => {
-            const percent = data.totalPasswords ? (data.passwordIndex / data.totalPasswords * 100) : 0;
+            // Overall progress by examiner count
+            const percent = data.totalExaminers ? (data.examinerIndex / data.totalExaminers * 100) : 0;
             document.getElementById('progressBar').style.width = `${percent}%`;
             document.getElementById('progressPercent').innerText = `${Math.round(percent)}%`;
-            document.getElementById('currentTask').innerHTML = `Examiner ${data.examinerIndex+1}/${data.totalExaminers} (${data.currentExaminer}) | Password ${data.passwordIndex}/${data.totalPasswords}`;
+            document.getElementById('currentTask').innerHTML = `Examiner ${data.examinerIndex+1}/${data.totalExaminers} (${escapeHtml(data.currentExaminer)}) | Password #${data.passwordIndex}/${data.totalPasswords}`;
             document.getElementById('speed').innerText = data.speed || 0;
         });
 
         socket.on('success', (data) => {
-            // Add to table
+            // Add new success to the table (prepend)
             const tbody = document.getElementById('successTableBody');
-            const newRow = `<tr class="border-t border-gray-700"><td class="px-4 py-2">${data.examinerId}</td><td class="px-4 py-2">${data.password}</td><td class="px-4 py-2">${new Date(data.time).toLocaleString()}</td></tr>`;
+            const newRow = `
+                <tr class="border-t border-gray-700">
+                    <td class="px-3 py-2 font-mono text-xs">${escapeHtml(data.examinerId)}</td>
+                    <td class="px-3 py-2 font-mono text-xs">${escapeHtml(data.password)}</td>
+                    <td class="px-3 py-2 text-xs">${new Date(data.time).toLocaleString()}</td>
+                </tr>
+            `;
             if (tbody.children[0]?.innerText.includes('No successes')) {
                 tbody.innerHTML = newRow;
             } else {
                 tbody.innerHTML = newRow + tbody.innerHTML;
             }
-            const count = parseInt(document.getElementById('successCount').innerText) + 1;
-            document.getElementById('successCount').innerText = count;
+            // Update success count
+            const currentCount = parseInt(document.getElementById('successCount').innerText) || 0;
+            document.getElementById('successCount').innerText = currentCount + 1;
         });
 
         socket.on('status', (data) => {
-            if (data.running) document.getElementById('statusText').innerHTML = '<span class="text-green-400">Running</span>';
-            else if (data.paused) document.getElementById('statusText').innerHTML = '<span class="text-yellow-400">Paused</span>';
-            else document.getElementById('statusText').innerHTML = '<span class="text-gray-400">Idle</span>';
+            if (data.running) updateStatusUI('Running');
+            else if (data.paused) updateStatusUI('Paused');
+            else updateStatusUI('Idle');
         });
 
+        // RAM usage updates
+        socket.on('memory', (data) => {
+            document.getElementById('ramRss').innerText = data.rss || 0;
+            document.getElementById('ramHeapUsed').innerText = data.heapUsed || 0;
+            document.getElementById('ramHeapTotal').innerText = data.heapTotal || 0;
+        });
+
+        function updateStatusUI(status) {
+            const statusEl = document.getElementById('statusText');
+            if (status === 'Running') statusEl.innerHTML = '<span class="text-green-400 animate-pulse">● Running</span>';
+            else if (status === 'Paused') statusEl.innerHTML = '<span class="text-yellow-400">⏸ Paused</span>';
+            else statusEl.innerHTML = '<span class="text-gray-400">⏹ Idle</span>';
+        }
+
+        // Button controls
         document.getElementById('startBtn').onclick = () => socket.emit('start');
         document.getElementById('pauseBtn').onclick = () => socket.emit('pause');
         document.getElementById('resumeBtn').onclick = () => socket.emit('resume');
