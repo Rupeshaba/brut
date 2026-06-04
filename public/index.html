@@ -3,21 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
-    <title>HOD Login Auditor</title>
-    <!-- Tailwind CSS CDN -->
+    <title>HOD Login Auditor – Parallel Attack</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Socket.io client -->
     <script src="/socket.io/socket.io.js"></script>
     <style>
-        /* Smooth transitions for progress bar */
-        .progress-transition {
-            transition: width 0.3s ease-in-out;
-        }
-        /* Make table scrollable on mobile */
-        .table-container {
-            overflow-x: auto;
-            -webkit-overflow-scrolling: touch;
-        }
+        .progress-transition { transition: width 0.3s ease-in-out; }
+        .table-container { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+        .animate-pulse { animation: pulse 2s cubic-bezier(0.4,0,0.6,1) infinite; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
     </style>
 </head>
 <body class="bg-gradient-to-br from-gray-900 to-gray-800 text-white min-h-screen">
@@ -27,37 +20,37 @@
             <h1 class="text-3xl md:text-4xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-400">
                 🔐 HOD Login Auditor
             </h1>
-            <p class="text-gray-400 text-sm mt-1">Multi‑examiner parallel attack</p>
+            <p class="text-gray-400 text-sm mt-1">Parallel examiners | Real‑time</p>
         </div>
 
-        <!-- Stats Cards Grid (responsive) -->
+        <!-- Stats Cards Grid -->
         <div class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-6">
-            <div class="bg-gray-800/80 backdrop-blur rounded-xl p-3 shadow-lg border border-gray-700">
-                <div class="text-gray-400 text-xs uppercase tracking-wide">Total Examiners</div>
-                <div class="text-2xl font-bold text-white" id="totalExaminers">0</div>
+            <div class="bg-gray-800/80 rounded-xl p-3 shadow-lg border border-gray-700">
+                <div class="text-gray-400 text-xs uppercase">Total Examiners</div>
+                <div class="text-2xl font-bold" id="totalExaminers">0</div>
             </div>
-            <div class="bg-gray-800/80 backdrop-blur rounded-xl p-3 shadow-lg border border-gray-700">
-                <div class="text-gray-400 text-xs uppercase tracking-wide">Successes</div>
+            <div class="bg-gray-800/80 rounded-xl p-3 shadow-lg border border-gray-700">
+                <div class="text-gray-400 text-xs uppercase">Successes</div>
                 <div class="text-2xl font-bold text-green-400" id="successCount">0</div>
             </div>
-            <div class="bg-gray-800/80 backdrop-blur rounded-xl p-3 shadow-lg border border-gray-700">
-                <div class="text-gray-400 text-xs uppercase tracking-wide">Speed (req/s)</div>
+            <div class="bg-gray-800/80 rounded-xl p-3 shadow-lg border border-gray-700">
+                <div class="text-gray-400 text-xs uppercase">Speed (req/s)</div>
                 <div class="text-2xl font-bold text-blue-400" id="speed">0</div>
             </div>
-            <div class="bg-gray-800/80 backdrop-blur rounded-xl p-3 shadow-lg border border-gray-700">
-                <div class="text-gray-400 text-xs uppercase tracking-wide">Status</div>
+            <div class="bg-gray-800/80 rounded-xl p-3 shadow-lg border border-gray-700">
+                <div class="text-gray-400 text-xs uppercase">Status</div>
                 <div class="text-xl font-bold" id="statusText">Idle</div>
             </div>
         </div>
 
-        <!-- RAM Usage Card (real-time) -->
+        <!-- RAM Usage -->
         <div class="bg-gray-800/50 rounded-xl p-3 mb-6 border border-gray-700">
             <div class="flex flex-wrap justify-between items-center gap-2">
                 <span class="text-gray-300 text-sm flex items-center gap-1">
                     <span class="inline-block w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
-                    📟 Live RAM Usage
+                    📟 Live RAM
                 </span>
-                <div class="flex gap-4 text-sm">
+                <div class="flex gap-4 text-sm flex-wrap">
                     <div><span class="text-gray-400">RSS:</span> <span id="ramRss" class="font-mono font-bold text-yellow-300">0</span> MB</div>
                     <div><span class="text-gray-400">Heap Used:</span> <span id="ramHeapUsed" class="font-mono font-bold text-yellow-300">0</span> MB</div>
                     <div><span class="text-gray-400">Heap Total:</span> <span id="ramHeapTotal" class="font-mono text-gray-300">0</span> MB</div>
@@ -65,19 +58,26 @@
             </div>
         </div>
 
-        <!-- Progress Section -->
+        <!-- Overall Progress -->
         <div class="bg-gray-800/50 rounded-xl p-4 mb-6 border border-gray-700">
             <div class="flex justify-between text-sm mb-1">
-                <span>Progress by examiner</span>
-                <span id="progressPercent">0%</span>
+                <span>Overall Progress (examiners completed)</span>
+                <span id="overallPercent">0%</span>
             </div>
             <div class="w-full bg-gray-700 rounded-full h-3 mb-3">
-                <div id="progressBar" class="bg-gradient-to-r from-blue-500 to-purple-500 h-3 rounded-full progress-transition" style="width: 0%"></div>
+                <div id="overallProgressBar" class="bg-gradient-to-r from-blue-500 to-purple-500 h-3 rounded-full progress-transition" style="width: 0%"></div>
             </div>
-            <div id="currentTask" class="text-sm text-gray-300 break-all">Ready</div>
         </div>
 
-        <!-- Control Buttons (responsive grid) -->
+        <!-- Per‑Examiner Status (active examiners) -->
+        <div class="bg-gray-800/50 rounded-xl p-4 mb-6 border border-gray-700">
+            <div class="text-sm font-semibold mb-2">⚙️ Active Examiners (parallel)</div>
+            <div id="activeExaminersList" class="text-xs space-y-1 text-gray-300">
+                <div class="text-gray-500 italic">Waiting for attack to start...</div>
+            </div>
+        </div>
+
+        <!-- Control Buttons -->
         <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-8">
             <button id="startBtn" class="bg-green-600 hover:bg-green-700 active:scale-95 transition transform py-2 rounded-lg font-semibold shadow-lg">▶ Start</button>
             <button id="pauseBtn" class="bg-yellow-600 hover:bg-yellow-700 active:scale-95 transition transform py-2 rounded-lg font-semibold shadow-lg">⏸ Pause</button>
@@ -85,7 +85,7 @@
             <button id="stopBtn" class="bg-red-600 hover:bg-red-700 active:scale-95 transition transform py-2 rounded-lg font-semibold shadow-lg">⏹ Stop & Reset</button>
         </div>
 
-        <!-- Success Table (scrollable) -->
+        <!-- Success Table -->
         <div class="bg-gray-800/50 rounded-xl overflow-hidden border border-gray-700">
             <div class="px-4 py-3 bg-gray-800 border-b border-gray-700 font-semibold flex justify-between items-center flex-wrap gap-2">
                 <span>✅ Found Credentials</span>
@@ -101,45 +101,23 @@
                         </tr>
                     </thead>
                     <tbody id="successTableBody">
-                        <tr>
-                            <td colspan="3" class="px-3 py-6 text-center text-gray-500">No successes yet</td>
-                        </tr>
+                        <tr><td colspan="3" class="px-3 py-6 text-center text-gray-500">No successes yet</td</tr>
                     </tbody>
                 </table>
             </div>
         </div>
 
-        <!-- Footer note -->
         <div class="text-center text-gray-500 text-xs mt-6">
-            Attack runs sequentially per examiner | 1M passwords per ID
+            Parallel examiners | Each tries all passwords | Checkpoint saves progress
         </div>
     </div>
 
     <script>
         const socket = io();
         let totalExaminers = 0;
-        let totalPasswords = 0;
+        let activeExaminers = new Map(); // examinerId -> { passwordIndex, totalPasswords }
 
-        // Helper: update success table
-        function updateSuccessTable(successes) {
-            const tbody = document.getElementById('successTableBody');
-            if (!successes || successes.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="3" class="px-3 py-6 text-center text-gray-500">No successes yet</td></tr>';
-                return;
-            }
-            // Build table rows (most recent first? server sends array, we'll show in order)
-            const rows = successes.map(s => `
-                <tr class="border-t border-gray-700">
-                    <td class="px-3 py-2 font-mono text-xs">${escapeHtml(s.examinerId)}</td>
-                    <td class="px-3 py-2 font-mono text-xs">${escapeHtml(s.password)}</td>
-                    <td class="px-3 py-2 text-xs">${s.time ? new Date(s.time).toLocaleString() : '-'}</td>
-                </tr>
-            `).join('');
-            tbody.innerHTML = rows;
-            document.getElementById('successCount').innerText = successes.length;
-        }
-
-        // Simple escape to avoid XSS
+        // Helper: escape HTML
         function escapeHtml(str) {
             if (!str) return '';
             return str.replace(/[&<>]/g, function(m) {
@@ -150,34 +128,91 @@
             });
         }
 
-        // Socket event handlers
+        // Update success table
+        function updateSuccessTable(successesArray) {
+            const tbody = document.getElementById('successTableBody');
+            if (!successesArray || successesArray.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="3" class="px-3 py-6 text-center text-gray-500">No successes yet</td></tr>';
+                document.getElementById('successCount').innerText = '0';
+                return;
+            }
+            const rows = successesArray.map(s => `
+                <tr class="border-t border-gray-700">
+                    <td class="px-3 py-2 font-mono text-xs">${escapeHtml(s.examinerId)}</td>
+                    <td class="px-3 py-2 font-mono text-xs">${escapeHtml(s.password)}</td>
+                    <td class="px-3 py-2 text-xs">${s.time ? new Date(s.time).toLocaleString() : '-'}</td>
+                </tr>
+            `).join('');
+            tbody.innerHTML = rows;
+            document.getElementById('successCount').innerText = successesArray.length;
+        }
+
+        // Update active examiners display
+        function updateActiveExaminers() {
+            const container = document.getElementById('activeExaminersList');
+            if (activeExaminers.size === 0) {
+                container.innerHTML = '<div class="text-gray-500 italic">No active examiners (idle)</div>';
+                return;
+            }
+            let html = '';
+            for (const [examinerId, data] of activeExaminers.entries()) {
+                const percent = data.totalPasswords ? Math.round((data.passwordIndex / data.totalPasswords) * 100) : 0;
+                html += `<div class="flex justify-between items-center border-b border-gray-700 py-1">
+                            <span class="font-mono text-xs">${escapeHtml(examinerId)}</span>
+                            <span class="text-xs text-blue-300">${data.passwordIndex}/${data.totalPasswords} (${percent}%)</span>
+                        </div>`;
+            }
+            container.innerHTML = html;
+        }
+
+        // Socket events
         socket.on('init', (data) => {
             totalExaminers = data.totalExaminers;
-            totalPasswords = data.totalPasswords || 0;
             document.getElementById('totalExaminers').innerText = totalExaminers;
-            updateSuccessTable(data.successes || []);
-            // Update progress based on checkpoint
-            if (data.currentExaminerIndex !== undefined) {
-                const percent = totalExaminers ? (data.currentExaminerIndex / totalExaminers * 100) : 0;
-                document.getElementById('progressBar').style.width = `${percent}%`;
-                document.getElementById('progressPercent').innerText = `${Math.round(percent)}%`;
-                document.getElementById('currentTask').innerHTML = `Examiner ${data.currentExaminerIndex+1}/${totalExaminers} | Password #${data.currentPasswordIndex} of ${totalPasswords}`;
+            if (data.successes) updateSuccessTable(data.successes);
+            else updateSuccessTable([]);
+            // Set total passwords for active display later
+            const totalPass = data.totalPasswords || 0;
+            // Optionally store totalPasswords globally
+            window.totalPasswords = totalPass;
+            // Update overall progress if any
+            if (data.overallProgress) {
+                document.getElementById('overallProgressBar').style.width = `${data.overallProgress.percent}%`;
+                document.getElementById('overallPercent').innerText = `${data.overallProgress.percent}%`;
             }
             const status = data.isRunning ? 'Running' : (data.isPaused ? 'Paused' : 'Idle');
             updateStatusUI(status);
         });
 
-        socket.on('progress', (data) => {
-            // Overall progress by examiner count
-            const percent = data.totalExaminers ? (data.examinerIndex / data.totalExaminers * 100) : 0;
-            document.getElementById('progressBar').style.width = `${percent}%`;
-            document.getElementById('progressPercent').innerText = `${Math.round(percent)}%`;
-            document.getElementById('currentTask').innerHTML = `Examiner ${data.examinerIndex+1}/${data.totalExaminers} (${escapeHtml(data.currentExaminer)}) | Password #${data.passwordIndex}/${data.totalPasswords}`;
-            document.getElementById('speed').innerText = data.speed || 0;
+        // Overall progress from server (examiner completion)
+        socket.on('overallProgress', (data) => {
+            const percent = data.percent || 0;
+            document.getElementById('overallProgressBar').style.width = `${percent}%`;
+            document.getElementById('overallPercent').innerText = `${percent}%`;
         });
 
+        // Per‑examiner progress update (from server's 'progress' event)
+        socket.on('progress', (data) => {
+            // data: { examinerId, passwordIndex, totalPasswords, speed? }
+            if (data.examinerId) {
+                activeExaminers.set(data.examinerId, {
+                    passwordIndex: data.passwordIndex,
+                    totalPasswords: data.totalPasswords || window.totalPasswords || 0
+                });
+                updateActiveExaminers();
+            }
+            if (data.speed) {
+                document.getElementById('speed').innerText = data.speed;
+            }
+        });
+
+        // When an examiner finishes, we could remove it from active list (optional)
+        // Server doesn't send "finished" event, but we can clear when a success is found or after attack ends.
+        // For simplicity, we keep them until next batch. We'll also clear on stop.
+
+        // Success event
         socket.on('success', (data) => {
-            // Add new success to the table (prepend)
+            // Add to table (prepend)
             const tbody = document.getElementById('successTableBody');
             const newRow = `
                 <tr class="border-t border-gray-700">
@@ -191,18 +226,23 @@
             } else {
                 tbody.innerHTML = newRow + tbody.innerHTML;
             }
-            // Update success count
             const currentCount = parseInt(document.getElementById('successCount').innerText) || 0;
             document.getElementById('successCount').innerText = currentCount + 1;
+            // Remove this examiner from active list if present
+            if (activeExaminers.has(data.examinerId)) {
+                activeExaminers.delete(data.examinerId);
+                updateActiveExaminers();
+            }
         });
 
+        // Status update
         socket.on('status', (data) => {
             if (data.running) updateStatusUI('Running');
             else if (data.paused) updateStatusUI('Paused');
             else updateStatusUI('Idle');
         });
 
-        // RAM usage updates
+        // RAM usage
         socket.on('memory', (data) => {
             document.getElementById('ramRss').innerText = data.rss || 0;
             document.getElementById('ramHeapUsed').innerText = data.heapUsed || 0;
@@ -216,11 +256,28 @@
             else statusEl.innerHTML = '<span class="text-gray-400">⏹ Idle</span>';
         }
 
-        // Button controls
+        // Clear active examiners on stop (optional, but we'll also listen to reset)
+        socket.on('init', (data) => {
+            if (!data.isRunning && !data.isPaused && data.successes && data.successes.length === 0) {
+                activeExaminers.clear();
+                updateActiveExaminers();
+                document.getElementById('overallProgressBar').style.width = '0%';
+                document.getElementById('overallPercent').innerText = '0%';
+            }
+        });
+
+        // Control buttons
         document.getElementById('startBtn').onclick = () => socket.emit('start');
         document.getElementById('pauseBtn').onclick = () => socket.emit('pause');
         document.getElementById('resumeBtn').onclick = () => socket.emit('resume');
-        document.getElementById('stopBtn').onclick = () => socket.emit('stop');
+        document.getElementById('stopBtn').onclick = () => {
+            socket.emit('stop');
+            activeExaminers.clear();
+            updateActiveExaminers();
+            document.getElementById('overallProgressBar').style.width = '0%';
+            document.getElementById('overallPercent').innerText = '0%';
+            document.getElementById('speed').innerText = '0';
+        };
     </script>
 </body>
 </html>
